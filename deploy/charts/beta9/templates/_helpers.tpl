@@ -52,8 +52,63 @@ controllers:
         secret-hash: {{ include "sha256sum" (include "beta9.config" .) }}
     containers:
       main:
+        # The published config file has no passwords. This writes /etc/beta9.d/credentials.yaml
+        # from the beta9-credentials secret, then starts the gateway.
         command:
-        - /usr/local/bin/gateway
+        - /bin/sh
+        - -c
+        - |
+          set -eu
+          test -n "$POSTGRES_PASSWORD"
+          test -n "$REDIS_PASSWORD"
+          test -n "$STORAGE_ACCESS_KEY"
+          test -n "$STORAGE_SECRET_KEY"
+          test -n "$ENCRYPTION_KEY"
+          mkdir -p /etc/beta9.d
+          cp /etc/beta9-config/config.yaml /etc/beta9.d/config.yaml
+          {
+            printf '%s\n' 'database:'
+            printf '%s\n' '  postgres:'
+            printf '%s\n' '    username: beta9'
+            printf '%s\n' "    password: \"${POSTGRES_PASSWORD}\""
+            printf '%s\n' "    encryptionKey: \"${ENCRYPTION_KEY}\""
+            printf '%s\n' '  redis:'
+            printf '%s\n' "    password: \"${REDIS_PASSWORD}\""
+            printf '%s\n' 'storage:'
+            printf '%s\n' '  workspaceStorage:'
+            printf '%s\n' '    defaultEndpointUrl: http://beta9-minio:9000'
+            printf '%s\n' '    defaultPresignedEndpointUrl: http://beta9-minio:9000'
+            printf '%s\n' "    defaultAccessKey: \"${STORAGE_ACCESS_KEY}\""
+            printf '%s\n' "    defaultSecretKey: \"${STORAGE_SECRET_KEY}\""
+            printf '%s\n' '    defaultRegion: us-east-1'
+          } > /etc/beta9.d/credentials.yaml
+          exec /usr/local/bin/gateway
+        env:
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: beta9-credentials
+              key: postgres-password
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: beta9-credentials
+              key: redis-password
+        - name: STORAGE_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: beta9-credentials
+              key: storage-access-key
+        - name: STORAGE_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: beta9-credentials
+              key: storage-secret-key
+        - name: ENCRYPTION_KEY
+          valueFrom:
+            secretKeyRef:
+              name: beta9-credentials
+              key: encryption-key
         image:
           repository: {{ .Values.images.gateway.repository }}
           tag: "{{ .Values.images.gateway.tag | default .Chart.AppVersion }}"
@@ -95,7 +150,8 @@ controllers:
                 service: liveness
         securityContext:
           privileged: true
-    hostNetwork: true
+    # Host networking would publish 1993 and 1994 on the node, past the ingress.
+    hostNetwork: false
 service:
   gateway:
     controller: gateway
@@ -110,9 +166,23 @@ persistence:
     type: secret
     name: beta9-config-helm
     globalMounts:
-    - path: /etc/beta9.d/config.yaml
+    - path: /etc/beta9-config/config.yaml
       subPath: config.yaml
       readOnly: true
+{{- end -}}
+
+{{/* htpasswd SHA1 ({SHA}base64), which nginx and Traefik basic auth both accept. */}}
+{{- define "beta9.htpasswdSHA" -}}
+{{- $hex := sha1sum . -}}
+{{- $digits := dict "0" 0 "1" 1 "2" 2 "3" 3 "4" 4 "5" 5 "6" 6 "7" 7 "8" 8 "9" 9 "a" 10 "b" 11 "c" 12 "d" 13 "e" 14 "f" 15 -}}
+{{- $raw := "" -}}
+{{- range $i := until 20 -}}
+{{- $offset := mul $i 2 -}}
+{{- $hi := index $digits (substr $offset (add $offset 1) $hex) -}}
+{{- $lo := index $digits (substr (add $offset 1) (add $offset 2) $hex) -}}
+{{- $raw = printf "%s%c" $raw (int (add (mul $hi 16) $lo)) -}}
+{{- end -}}
+{{- printf "{SHA}%s" ($raw | b64enc) -}}
 {{- end -}}
 
 

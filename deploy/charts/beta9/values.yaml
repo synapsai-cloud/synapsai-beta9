@@ -20,15 +20,14 @@ config:
   monitoring:
     telemetry:
       enabled: false
-  # Checkpoint archives go to the workspace bucket. The embedded default
-  # (http://localstack:4566, access key "test") expects LocalStack. Point
-  # this at a MinIO or other S3 endpoint the worker pods can reach.
-  # storage:
-  #   workspaceStorage:
-  #     defaultEndpointUrl: http://minio.minio.svc:9000
-  #     defaultAccessKey: ""
-  #     defaultSecretKey: ""
-  #     defaultRegion: us-east-1
+  # Checkpoint archives go to the in-cluster MinIO. The access key and secret
+  # key are generated into the beta9-credentials secret and applied when the
+  # gateway starts. The embedded LocalStack test/test credentials are overridden.
+  storage:
+    workspaceStorage:
+      defaultEndpointUrl: http://beta9-minio:9000
+      defaultPresignedEndpointUrl: http://beta9-minio:9000
+      defaultRegion: us-east-1
   worker:
     imageRegistry: public.ecr.aws/n4e0e1y0
     # Empty so each node uses its /images host path. A shared claim cannot
@@ -131,6 +130,9 @@ controllers:
   gateway:
     annotations: {}
     labels: {}
+    # The chart template also forces this off. Host networking would publish
+    # the gateway ports on the node and skip the ingress.
+    hostNetwork: false
     replicas: 1
     pod:
       # 180s gateway shutdownTimeout + 10s readiness propagation + 5s buffer.
@@ -150,6 +152,7 @@ controllers:
         - |
           until nc -z postgresql 5432; do echo "Waiting on PostgreSQL..."; sleep 2; done;
           until nc -z redis-master 6379; do echo "Waiting on Redis..."; sleep 2; done;
+          until nc -z beta9-minio 9000; do echo "Waiting on MinIO..."; sleep 2; done;
           echo "All systems ready!"
 
 persistence:
@@ -183,15 +186,33 @@ service:
         port: 9090
         targetPort: 9090
         protocol: TCP
-    # ClusterIP is only reachable inside the cluster.
-    type: LoadBalancer
-    # type: ClusterIP
+    type: ClusterIP
+    # type: LoadBalancer
 
 ingress:
+  # k3s includes this CRD. Set false on a cluster that has no Traefik and uses
+  # the nginx basic-auth annotations below instead.
+  traefik:
+    enabled: true
   gateway:
-    enabled: false
-    annotations: {}
+    enabled: true
+    # Install into the beta9 namespace. The Traefik middleware reference below
+    # is <namespace>-<middleware name>@kubernetescrd.
+    className:
+    annotations:
+      nginx.ingress.kubernetes.io/auth-type: basic
+      nginx.ingress.kubernetes.io/auth-secret: beta9-ingress-auth
+      nginx.ingress.kubernetes.io/auth-realm: SynapsAI Beta9
+      traefik.ingress.kubernetes.io/router.middlewares: beta9-beta9-auth@kubernetescrd
     labels: {}
+    hosts:
+      - host: gateway.beta9.local
+        paths:
+          - path: /
+            pathType: Prefix
+            service:
+              name: gateway
+              port: http
 
 serviceAccount:
   name: beta9
@@ -211,7 +232,10 @@ redis:
   fullnameOverride: redis
   architecture: standalone
   auth:
-    enabled: false
+    enabled: true
+    existingSecret: beta9-credentials
+    existingSecretPasswordKey: redis-password
+    sentinel: false
   master:
     configuration: |
       activedefrag yes
@@ -227,9 +251,13 @@ postgresql:
   global:
     postgresql:
       auth:
-        username: root
-        password: password
+        username: beta9
         database: main
+        existingSecret: beta9-credentials
+        secretKeys:
+          adminPasswordKey: postgres-admin-password
+          userPasswordKey: postgres-password
+          replicationPasswordKey: replication-password
   primary:
     extendedConfiguration: |
       max_connections=400
