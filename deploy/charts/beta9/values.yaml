@@ -6,11 +6,65 @@ global:
   nameOverride: beta9
 
 # -- Beta9's configuration.
+# Merged on top of pkg/common/config.default.yaml. This profile keeps the
+# gateway, Postgres, Redis, per-node image cache, and GPU checkpoint path,
+# and turns off the services a local inference cluster does not need.
 # https://github.com/beam-cloud/beta9/blob/main/pkg/common/config.default.yaml
 config:
+  fileService:
+    enabled: false
+  tailscale:
+    enabled: false
+  managedEndpoints:
+    enabled: false
+  monitoring:
+    telemetry:
+      enabled: false
+  # Checkpoint archives go to the workspace bucket. The embedded default
+  # (http://localstack:4566, access key "test") expects LocalStack. Point
+  # this at a MinIO or other S3 endpoint the worker pods can reach.
+  # storage:
+  #   workspaceStorage:
+  #     defaultEndpointUrl: http://minio.minio.svc:9000
+  #     defaultAccessKey: ""
+  #     defaultSecretKey: ""
+  #     defaultRegion: us-east-1
   worker:
     imageRegistry: public.ecr.aws/n4e0e1y0
+    # Empty so each node uses its /images host path. A shared claim cannot
+    # mount on more than one node.
     imagePVCName: ""
+    criu:
+      mode: nvidia
+    pools:
+      # Embedded defaults keep free capacity warm: default is 2 CPU / 1Gi,
+      # build is 8 CPU / 32Gi. Zero keeps those workers from sitting idle.
+      default:
+        poolSizing:
+          minFreeCpu: "0"
+          minFreeMemory: "0"
+          minFreeGpu: 0
+      build:
+        poolSizing:
+          minFreeCpu: "0"
+          minFreeMemory: "0"
+          minFreeGpu: 0
+      nvidia:
+        mode: local
+        gpuType: any
+        runtime: nvidia
+        containerRuntime: gvisor
+        criuEnabled: true
+        containerRuntimeConfig:
+          gvisorPlatform: systrap
+          gvisorRoot: /run/gvisor
+          gvisorExtraArgs:
+            - --overlay2=none
+            - --file-access=exclusive
+        poolSizing:
+          minFreeCpu: "0"
+          minFreeMemory: "0"
+          minFreeGpu: 0
   imageService:
     runner:
       baseImageRegistry: public.ecr.aws/n4e0e1y0
@@ -41,6 +95,8 @@ images:
     tag:        # Defaults to chart's app version
     pullPolicy: # Defaults to IfNotPresent
 
+# Worker pods already serve their own disk cache. This DaemonSet is a second
+# cache process on every node.
 cacheServer:
   enabled: false
   configSecretName: beta9-config-helm
@@ -98,11 +154,14 @@ controllers:
 
 persistence:
   images:
-    enabled: true
-    type: persistentVolumeClaim
-    size: 50Gi
-    storageClass: local-path
-    accessMode: ReadWriteOnce
+    # A 50Gi local-path ReadWriteOnce claim can attach to one node only.
+    # config.worker.imagePVCName is empty, so workers use the /images host path.
+    enabled: false
+    # enabled: true
+    # type: persistentVolumeClaim
+    # size: 50Gi
+    # storageClass: local-path
+    # accessMode: ReadWriteOnce
 
 service:
   gateway:
@@ -124,7 +183,9 @@ service:
         port: 9090
         targetPort: 9090
         protocol: TCP
-    type: ClusterIP
+    # ClusterIP is only reachable inside the cluster.
+    type: LoadBalancer
+    # type: ClusterIP
 
 ingress:
   gateway:
@@ -138,6 +199,7 @@ serviceAccount:
   labels: {}
 
 # -- In-memory cache for container images.
+# Checkpoints use the worker disk cache and the workspace bucket.
 # https://github.com/beam-cloud/blobcache/deploy/charts/blobcache/values.yaml
 blobcache:
   enabled: false
@@ -182,47 +244,47 @@ postgresql:
 metrics:
   enabled: false
 
-grafana:
-  nameOverride: grafana
-  fullnameOverride: grafana
-  datasources:
-   datasources.yaml:
-     apiVersion: 1
-     datasources:
-     - name: Victoria Metrics
-       type: prometheus
-       url: http://victoria-metrics-single:8428
-       access: proxy
-       isDefault: true
-
-victoria-metrics-agent:
-  nameOverride: victoria-metrics-agent
-  fullnameOverride: victoria-metrics-agent
-  remoteWriteUrls:
-  - http://victoria-metrics-single:8428/api/v1/write
-  extraScrapeConfigs:
-  - job_name: beta9-pods
-    metrics_path: /metrics
-    scheme: http
-    honor_labels: true
-    scrape_timeout: 10s
-    scrape_interval: 15s
-    kubernetes_sd_configs:
-    - role: pod
-      namespaces:
-        names:
-        - beta9
-    relabel_configs:
-    - source_labels: [__meta_kubernetes_pod_label_prometheus_io_scrape]
-      action: keep
-      regex: true
-    - source_labels: [__meta_kubernetes_pod_container_port_number]
-      action: keep
-      regex: 9090
-
-victoria-metrics-single:
-  server:
-    fullnameOverride: victoria-metrics-single
+# grafana:
+#   nameOverride: grafana
+#   fullnameOverride: grafana
+#   datasources:
+#    datasources.yaml:
+#      apiVersion: 1
+#      datasources:
+#      - name: Victoria Metrics
+#        type: prometheus
+#        url: http://victoria-metrics-single:8428
+#        access: proxy
+#        isDefault: true
+#
+# victoria-metrics-agent:
+#   nameOverride: victoria-metrics-agent
+#   fullnameOverride: victoria-metrics-agent
+#   remoteWriteUrls:
+#   - http://victoria-metrics-single:8428/api/v1/write
+#   extraScrapeConfigs:
+#   - job_name: beta9-pods
+#     metrics_path: /metrics
+#     scheme: http
+#     honor_labels: true
+#     scrape_timeout: 10s
+#     scrape_interval: 15s
+#     kubernetes_sd_configs:
+#     - role: pod
+#       namespaces:
+#         names:
+#         - beta9
+#     relabel_configs:
+#     - source_labels: [__meta_kubernetes_pod_label_prometheus_io_scrape]
+#       action: keep
+#       regex: true
+#     - source_labels: [__meta_kubernetes_pod_container_port_number]
+#       action: keep
+#       regex: 9090
+#
+# victoria-metrics-single:
+#   server:
+#     fullnameOverride: victoria-metrics-single
 
 # -- Used to add any custom manifests
 manifests:

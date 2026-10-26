@@ -1,139 +1,72 @@
-<div align="center">
-<p align="center">
-<img alt="Logo" src="static/beam-logo-white.png#gh-dark-mode-only" width="30%">
-<img alt="Logo" src="static/beam-logo-dark.png#gh-light-mode-only" width="30%">
-</p>
+# Beta9 for SynapsAI
 
-## Run AI Workloads at Scale
+This stack started as [beam-cloud/beta9](https://github.com/beam-cloud/beta9), the open-source runtime behind [Beam](https://beam.cloud). SynapsAI keeps that runtime and runs it as the compute plane for its own inference service and for client deployments. The Helm values in `deploy/charts/beta9/values.yaml` are the profile used for that: a gateway, Postgres, Redis, a GPU worker pool, and CRIU snapshot/restore. Grafana, VictoriaMetrics, blobcache, the extra cache-server DaemonSet, and the shared image volume are left off.
 
-<p align="center">
-  </a>
-    <a href="https://colab.research.google.com/drive/1jSDyYY7FY3Y3jJlCzkmHlH8vTyF-TEmB?usp=sharing">
-    <img alt="Colab" src="https://colab.research.google.com/assets/colab-badge.svg">
-  </a>
-  <a href="https://github.com/beam-cloud/beta9/stargazers">
-    <img alt="⭐ Star the Repo" src="https://img.shields.io/github/stars/beam-cloud/beta9">
-  </a>
-  <a href="https://docs.beam.cloud">
-    <img alt="Documentation" src="https://img.shields.io/badge/docs-quickstart-purple">
-  </a>
-  <a href="https://join.slack.com/t/beam-cloud/shared_invite/zt-4bf7jalhy-KI0ebGXk4vKpcDofwDjCLA">
-    <img alt="Join Slack" src="https://img.shields.io/badge/Beam-Join%20Slack-orange?logo=slack">
-  </a>
-    <a href="https://twitter.com/beam_cloud">
-    <img alt="Twitter" src="https://img.shields.io/twitter/follow/beam_cloud.svg?style=social&logo=twitter">
-  </a>
-    <a href="https://github.com/beam-cloud/beta9?tab=AGPL-3.0-1-ov-file">
-    <img alt="AGPL" src="https://img.shields.io/badge/License-AGPL-green">
-  </a>
-</p>
+The upstream project is licensed under AGPL-3.0. See `LICENSE`.
 
-</div>
+## What this cluster runs
 
-**[Beam](https://beam.cloud?utm_source=github_readme)** is a fast, open-source runtime for serverless AI workloads. It gives you a Pythonic interface to deploy and scale AI applications with zero infrastructure overhead.
+- Gateway on gRPC `1993` and HTTP `1994`. The first authorize against an empty database creates the workspace and an admin token.
+- Postgres and Redis, installed with the chart.
+- GPU workers in the `nvidia` pool (`gVisor`, `criu.mode: nvidia`). A memory checkpoint restores on a node with the same CPU features, GPU model, and driver. GPU nodes need an NVIDIA driver at or above 570.
+- A workspace object-storage bucket for checkpoint archives. The embedded default expects LocalStack at `http://localstack:4566`. Point `config.storage.workspaceStorage` in `deploy/charts/beta9/values.yaml` at a MinIO or other S3 endpoint the worker pods can reach before relying on snapshots.
 
-![Watch the demo](static/readme.gif)
+## Installation
 
-## ✨ Features
+Run this on a Linux Kubernetes cluster whose GPU machines are nodes in that cluster. k3s is a workable choice: one server, GPU machines joined as agents. Install the NVIDIA device plugin from `manifests/kustomize/components/nvidia-device-plugin`. Worker pods run privileged.
 
-- **Fast Cold Starts**: Launch containers in under a second using a custom container runtime, scheduler, and embedded caching
-- **Parallelization and Concurrency**: Fan out workloads to 100s of containers
-- **First-Class Developer Experience**: Hot-reloading, webhooks, and scheduled jobs
-- **Scale-to-Zero**: Workloads are serverless by default
-- **Volume Storage**: Mount distributed storage volumes
-- **GPU Support**: Run on our cloud (4090s, H100s, and more) or bring your own GPUs
-
-## 📦 Installation
+From this directory, with `helm` and `kubectl` aimed at the cluster:
 
 ```shell
-pip install beam-client
+helm dependency update deploy/charts/beta9
+helm upgrade --install beta9 deploy/charts/beta9 \
+  --create-namespace --namespace beta9 \
+  --values deploy/charts/beta9/values.yaml
 ```
 
-## ⚡️ Quickstart
+Pin `images.gateway.tag` and `images.worker.tag` in `deploy/charts/beta9/values.yaml` to a published release before installing. An empty tag falls through to the chart `appVersion`, which is the placeholder `0.1.0`. Images are published at `public.ecr.aws/n4e0e1y0/beta9-gateway` and `public.ecr.aws/n4e0e1y0/beta9-worker`.
 
-1. Create an account [here](https://beam.cloud?utm_source=github_readme)
-2. Follow our [Getting Started Guide](https://platform.beam.cloud/onboarding?utm_source=github_readme)
+The chart publishes the gateway as a LoadBalancer. gRPC is `1993` and HTTP is `1994`.
 
-## Creating a sandbox
-
-Spin up isolated containers to run LLM-generated code:
-
-```python
-from beam import Image, Sandbox
-
-
-sandbox = Sandbox(image=Image()).create()
-response = sandbox.process.run_code("print('I am running remotely')")
-
-print(response.result)
+```shell
+curl http://<gateway-host>:1994/api/v1/health
 ```
 
-## Deploy a serverless inference endpoint
+`make setup` is the upstream single-machine k3d development loop. It also applies the `cluster-dev` overlay, which starts the monitoring stack this profile leaves out.
 
-Create an autoscaling endpoint for your custom model:
+## Python SDK
 
-```python
-from beam import Image, endpoint
-from beam import QueueDepthAutoscaler
+The SDK in `sdk/` talks to whatever gateway its context names. Install it from this tree (Python 3.8 or newer):
 
-@endpoint(
-    image=Image(python_version="python3.11"),
-    gpu="A10G",
-    cpu=2,
-    memory="16Gi",
-    autoscaler=QueueDepthAutoscaler(max_containers=5, tasks_per_container=30)
-)
-def handler():
-    return {"label": "cat", "confidence": 0.97}
+```shell
+cd sdk
+uv sync
 ```
 
-## Run background tasks
+`import beam` (the package SynapsAI's orchestrator uses) switches the defaults to Beam Cloud unless the gateway is set in the environment before the import:
 
-Schedule resilient background tasks (or replace your Celery queue) by adding a simple decorator:
-
-```python
-from beam import Image, TaskPolicy, schema, task_queue
-
-
-class Input(schema.Schema):
-    image_url = schema.String()
-
-
-@task_queue(
-    name="image-processor",
-    image=Image(python_version="python3.11"),
-    cpu=1,
-    memory=1024,
-    inputs=Input,
-    task_policy=TaskPolicy(max_retries=3),
-)
-def my_background_task(input: Input, *, context):
-    image_url = input.image_url
-    print(f"Processing image: {image_url}")
-    return {"image_url": image_url}
-
-
-if __name__ == "__main__":
-    # Invoke a background task from your app (without deploying it)
-    my_background_task.put(image_url="https://example.com/image.jpg")
-
-    # You can also deploy this behind a versioned endpoint with:
-    # beam deploy app.py:my_background_task --name image-processor
+```shell
+GATEWAY_HOST=<gateway-host>
+GATEWAY_PORT=1993
+API_HOST=<gateway-host>
+API_PORT=1994
+BEAM_TOKEN=<workspace-token>
 ```
 
-> ## Self-Hosting vs Cloud
->
-> Beta9 is the open-source engine powering [Beam](https://beam.cloud), our fully-managed cloud platform. You can self-host Beta9 for free or choose managed cloud hosting through Beam.
+The same values can live in `~/.beam/config.ini`, which is the file the `beam` import reads:
 
-## 👋 Contributing
+```ini
+[default]
+token = <workspace-token>
+gateway_host = <gateway-host>
+gateway_port = 1993
+api_url = http://<gateway-host>:1994
+```
 
-We welcome contributions big or small. These are the most helpful things for us:
+The `beta9` CLI from `sdk/` reads `~/.beta9/config.ini` with those same keys. With no token and an empty database, the first authorize mints the workspace and writes the admin token into that file:
 
-- Submit a [feature request](https://github.com/beam-cloud/beta9/issues/new?assignees=&labels=&projects=&template=feature-request.md&title=) or [bug report](https://github.com/beam-cloud/beta9/issues/new?assignees=&labels=&projects=&template=bug-report.md&title=)
-- Open a PR with a new feature or improvement
+```shell
+GATEWAY_HOST=<gateway-host> GATEWAY_PORT=1993 beta9
+```
 
-## ❤️ Thanks to Our Contributors
-
-<a href="https://github.com/beam-cloud/beta9/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=beam-cloud/beta9" />
-</a>
+After that, set `BEAM_TOKEN` to the saved token so the SynapsAI orchestrator deploys pods to this gateway.
